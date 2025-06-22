@@ -326,53 +326,65 @@ def feature_2():
                             try:
                                 attachments = confluence.get(f"/rest/api/content/{page_id}/child/attachment?limit=50")
                                 for attachment in attachments["results"]:
-                                    video_name = attachment["title"].strip()
-                                    if video_name.lower().endswith(".mp4"):
-                                        session_key = f"{page_id}_{video_name}".replace(" ", "_")
-                                        if session_key not in st.session_state:
-                                            progress = st.progress(0, text="Starting...")
-                                            try:
-                                                video_url = attachment["_links"]["download"]
-                                                full_url = f"{os.getenv('CONFLUENCE_BASE_URL').rstrip('/')}{video_url}"
-                                                video_data = confluence._session.get(full_url).content
-                                                local_path = f"{title}_{video_name}".replace(" ", "_")
-                                                with open(local_path, "wb") as f:
-                                                    f.write(video_data)
-                                                progress.progress(20, "🎞 Extracting audio...")
-                                                if VideoFileClip is None or WhisperModel is None:
-                                                    st.warning("Video/audio libraries not installed.")
-                                                    continue
-                                                video = VideoFileClip(local_path)
-                                                video.audio.write_audiofile("temp_audio.mp3")
-                                                progress.progress(40, "🔊 Transcribing audio...")
-                                                model = WhisperModel("small", device="cpu", compute_type="int8")
-                                                segments, _ = model.transcribe("temp_audio.mp3")
-                                                transcript_with_timestamps = []
-                                                for s in segments:
-                                                    start_min = int(s.start // 60)
-                                                    start_sec = int(s.start % 60)
-                                                    timestamp = f"[{start_min}:{start_sec:02}]"
-                                                    transcript_with_timestamps.append(f"{timestamp} {s.text}")
-                                                full_transcript = "\n".join(transcript_with_timestamps)
-                                                progress.progress(65, "✍️ Generating quotes...")
-                                                quote_prompt = f"Set a title \"Quotes:\" in bold. Extract powerful or interesting quotes:\n{full_transcript}"
-                                                quotes = ai_model.generate_content(quote_prompt).text
-                                                st.session_state[f"{session_key}_quotes"] = quotes
-                                                progress.progress(80, "📚 Generating summary...")
-                                                summary_prompt = (
-                                                    f"Start with title as \"Summary:\" in bold, followed by 2-3 paragraphs.\n"
-                                                    f"Then add title \"Timestamps:\" and list bullet points with [min:sec]:\n{full_transcript}"
-                                                )
-                                                summary = ai_model.generate_content(summary_prompt).text
-                                                progress.progress(100, "✅ Done!")
-                                                st.session_state[session_key] = {
-                                                    "transcript": full_transcript,
-                                                    "summary": summary
-                                                }
-                                                title_placeholder.markdown(f"---\n### 🎬 Processed: `{title}`")
-                                            except Exception as ve:
-                                                progress.empty()
-                                                st.warning(f"⚠️ Could not process {video_name}: {ve}")
+                                    video_name = attachment["title"].strip()if video_name.lower().endswith(".mp4"):
+    session_key = f"{page_id}_{video_name}".replace(" ", "_")
+    if session_key not in st.session_state:
+        progress = st.progress(0, text="Starting...")
+        try:
+            import tempfile
+            import shutil
+            tmp_dir = tempfile.mkdtemp()
+            local_path = os.path.join(tmp_dir, f"{title}_{video_name}".replace(" ", "_"))
+
+            # Download video
+            video_url = attachment["_links"]["download"]
+            full_url = f"{os.getenv('CONFLUENCE_BASE_URL').rstrip('/')}{video_url}"
+            video_data = confluence._session.get(full_url).content
+            with open(local_path, "wb") as f:
+                f.write(video_data)
+
+            progress.progress(20, "🎞 Extracting audio...")
+            video = VideoFileClip(local_path).subclip(0, 120)
+            audio_path = os.path.join(tmp_dir, "temp_audio.mp3")
+            video.audio.write_audiofile(audio_path)
+            video.reader.close()
+            if video.audio:
+                video.audio.reader.close_proc()
+            video.close()
+
+            progress.progress(40, "🔊 Transcribing audio...")
+            model = WhisperModel("small", device="cpu", compute_type="int8")
+            segments, _ = model.transcribe(audio_path)
+
+            transcript_with_timestamps = [
+                f"[{int(s.start // 60)}:{int(s.start % 60):02}] {s.text}" for s in segments
+            ]
+            full_transcript = "\n".join(transcript_with_timestamps[:100])  # limit to avoid memory bloat
+
+            progress.progress(65, "✍️ Generating quotes...")
+            quote_prompt = f"**Quotes:** Extract 3-5 powerful quotes from:\n{full_transcript}"
+            quotes = ai_model.generate_content(quote_prompt).text.strip()
+
+            progress.progress(80, "📚 Generating summary...")
+            summary_prompt = (
+                f"**Summary:** Provide a 2-paragraph overview and include timestamps:\n\n{full_transcript}"
+            )
+            summary = ai_model.generate_content(summary_prompt).text.strip()
+
+            progress.progress(100, "✅ Done!")
+            st.session_state[session_key] = {
+                "transcript": full_transcript,
+                "summary": summary,
+                "quotes": quotes
+            }
+
+            # 🔁 Clean up temp files after processing
+            shutil.rmtree(tmp_dir)
+
+        except Exception as ve:
+            progress.empty()
+            st.warning(f"⚠️ Could not process {video_name}: {ve}")
+
                                         else:
                                             title_placeholder.markdown(f"---\n### 🎬 Processed: `{title}`")
                                         full_transcript = st.session_state[session_key]["transcript"]

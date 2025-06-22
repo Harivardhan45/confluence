@@ -1,23 +1,29 @@
-# Optimized Confluence Video Summarizer (No Duplicate Summary, CPU-Friendly)
 import os
+import re
 import streamlit as st
 from dotenv import load_dotenv
 from atlassian import Confluence
-import google.generativeai as genai
-from moviepy.editor import VideoFileClip
-from faster_whisper import WhisperModel
 from fpdf import FPDF
 from io import BytesIO
+import google.generativeai as genai
+from moviepy import VideoFileClip
+from faster_whisper import WhisperModel
 import warnings
 
 warnings.filterwarnings("ignore")
-
-# Load environment
 load_dotenv()
 
-# Configure Gemini API
-genai.configure(api_key=os.getenv("GOOGLE_API_KEY") or os.getenv("GENAI_API_KEY") or os.getenv("GEMINI_API_KEY"))
+# Helper
+def remove_emojis(text):
+    emoji_pattern = re.compile(
+        "["u"\U0001F600-\U0001F64F"
+        u"\U0001F300-\U0001F5FF"
+        u"\U0001F680-\U0001F6FF"
+        u"\U0001F1E0-\U0001F1FF"
+        "]+", flags=re.UNICODE)
+    return emoji_pattern.sub(r'', text).encode('latin-1', 'ignore').decode('latin-1')
 
+# Init
 @st.cache_resource
 def init_confluence():
     try:
@@ -31,153 +37,105 @@ def init_confluence():
         st.error(f"Confluence init failed: {e}")
         return None
 
-st.title("📄 Confluence Video Summarizer (Fast Mode)")
-
-confluence = init_confluence()
+genai.configure(api_key=os.getenv("GENAI_API_KEY"))
 ai_model = genai.GenerativeModel("models/gemini-1.5-flash-8b-latest")
+
+# Main UI
+st.title("📄 Confluence Video Summarizer")
+confluence = init_confluence()
 
 if confluence:
     st.success("✅ Connected to Confluence!")
 
-    space_key = st.text_input("Enter your space key:")
+    space_key = st.text_input("Enter your Confluence Space Key:")
     if space_key:
         try:
             pages = confluence.get_all_pages_from_space(space=space_key, start=0, limit=100)
-            page_titles = [page["title"] for page in pages]
-            selected_pages = st.multiselect("Select Confluence Pages:", page_titles)
-
+            page_titles = [p["title"] for p in pages]
+            selected_pages = st.multiselect("Select Pages to Process:", page_titles)
             if selected_pages:
                 summaries = []
-                displayed_sessions = set()
+                for page in pages:
+                    if page["title"] not in selected_pages:
+                        continue
+                    title = page["title"]
+                    page_id = page["id"]
+                    st.markdown(f"### 🎬 Processing: {title}")
+                    attachments = confluence.get(f"/rest/api/content/{page_id}/child/attachment?limit=50")
+                    for attachment in attachments["results"]:
+                        video_name = attachment["title"].strip()
+                        if not video_name.lower().endswith(".mp4"):
+                            continue
+                        session_key = f"{page_id}_{video_name}".replace(" ", "_")
+                        if session_key in st.session_state:
+                            st.info(f"🟡 Cached summary found for {video_name}")
+                        else:
+                            with st.spinner("📥 Downloading and processing..."):
+                                try:
+                                    video_url = attachment["_links"]["download"]
+                                    full_url = f"{os.getenv('CONFLUENCE_BASE_URL').rstrip('/')}{video_url}"
+                                    local_path = f"{title}_{video_name}".replace(" ", "_")
+                                    video_data = confluence._session.get(full_url).content
+                                    with open(local_path, "wb") as f:
+                                        f.write(video_data)
+                                    video = VideoFileClip(local_path)
+                                    video.audio.write_audiofile("temp_audio.mp3")
+                                    model = WhisperModel("tiny", device="cpu", compute_type="int8")
+                                    segments, _ = model.transcribe("temp_audio.mp3")
+                                    transcript = "\n".join(
+                                        f"[{int(s.start // 60)}:{int(s.start % 60):02}] {s.text}" for s in segments
+                                    )
+                                    quote_prompt = f"Set a title \"Quotes:\" in bold. Extract powerful or interesting quotes:\n{transcript}"
+                                    quotes = ai_model.generate_content(quote_prompt).text
+                                    summary_prompt = (
+                                        f"Start with title as \"Summary:\" in bold, followed by a paragraph.\n"
+                                        f"Then add title \"Timestamps:\" and list bullet points with [min:sec]:\n{transcript}"
+                                    )
+                                    summary = ai_model.generate_content(summary_prompt).text
+                                    st.session_state[session_key] = {
+                                        "transcript": transcript,
+                                        "summary": summary,
+                                        "quotes": quotes
+                                    }
+                                except Exception as e:
+                                    st.error(f"❌ Error: {e}")
+                                    continue
 
-                for title in selected_pages:
-                    page = next((p for p in pages if p["title"] == title), None)
-                    if page:
-                        page_id = page["id"]
-                        st.markdown(f"---\n### 🎬 Processing: {title}")
-                        try:
-                            attachments = confluence.get(f"/rest/api/content/{page_id}/child/attachment?limit=50")
-                            for attachment in attachments["results"]:
-                                video_name = attachment["title"].strip()
-                                if video_name.lower().endswith(".mp4"):
-                                    session_key = f"{page_id}{attachment['id']}".replace(" ", "")
+                        content = st.session_state[session_key]
+                        st.markdown(f"#### 📄 {video_name}")
+                        st.markdown(content["quotes"])
+                        st.markdown(content["summary"])
+                        summaries.append((f"{title}_{video_name}", content["summary"], content["quotes"]))
 
-                                    if session_key not in st.session_state:
-                                        with st.spinner("📥 Downloading and processing video..."):
-                                            video_url = attachment["_links"]["download"]
-                                            full_url = f"{os.getenv('CONFLUENCE_BASE_URL').rstrip('/')}{video_url}"
-                                            video_data = confluence._session.get(full_url).content
-                                            local_path = f"{title}{video_name}".replace(" ", "")
+                if summaries:
+                    st.markdown("## 📦 Export All Summaries")
+                    all_text = ""
+                    for t, s, q in summaries:
+                        all_text += f"\n\n---\n\n{t}\n\nQuotes:\n{q}\n\nSummary:\n{s}\n"
 
-                                            with open(local_path, "wb") as f:
-                                                f.write(video_data)
-
-                                            video_clip = VideoFileClip(local_path)
-                                            duration = min(120, video_clip.duration)
-                                            video = video_clip.subclip(0, duration)
-                                            video.audio.write_audiofile("temp_audio.mp3")
-
-                                            model = WhisperModel("tiny", device="cpu", compute_type="int8")
-                                            segments, _ = model.transcribe("temp_audio.mp3")
-                                            transcript_lines = [
-                                                f"[{int(s.start // 60)}:{int(s.start % 60):02}] {s.text}" for s in segments
-                                            ]
-                                            full_transcript = "\n".join(transcript_lines)
-                                            short_transcript = full_transcript[:3500]
-
-                                            quote_prompt = f"Set a title \"Quotes:\" in bold. Extract powerful or interesting quotes:\n{full_transcript}"
-                                            quotes = ai_model.generate_content(quote_prompt).text
-                                            summary_prompt = (
-                                                    f"Start with title as \"Summary:\" in bold, followed by a paragraph.\n"
-                                                    f"Then add title \"Timestamps:\" and list bullet points with imporatnt timestamps [min:sec] and small one line summarized description of each\n{full_transcript}"
-                                                )
-
-                                            quotes = ai_model.generate_content(quote_prompt).text
-                                            summary = ai_model.generate_content(summary_prompt).text
-
-                                            st.session_state[session_key] = {
-                                                "transcript": full_transcript,
-                                                "summary": summary,
-                                                "quotes": quotes
-                                            }
-
-                                    if session_key not in displayed_sessions:
-                                        displayed_sessions.add(session_key)
-
-                                        transcript = st.session_state[session_key]["transcript"]
-                                        summary = st.session_state[session_key]["summary"]
-                                        quotes = st.session_state[session_key]["quotes"]
-                                        summary_title = f"{title} - {video_name}"
-                                        summaries.append((summary_title, summary, quotes))
-
-                                        st.markdown(f"### 📄 {summary_title}")
-                                        st.markdown(quotes)
-                                        st.markdown(summary)
-
-                                        file_base = f"{summary_title.replace(' ', '')}".replace(":", "").replace("/", "")
-                                        format_choice = st.selectbox(
-                                            f"Download format for {summary_title}", ["PDF", "TXT"], key=f"format_{file_base}"
-                                        )
-
-                                        export_content = f"Top Quotes:\n{quotes}\n\nSummary with Timestamps:\n{summary}"
-
-                                        if format_choice == "PDF":
-                                            pdf = FPDF()
-                                            pdf.add_page()
-                                            pdf.set_font("Arial", size=12)
-                                            for line in export_content.split('\n'):
-                                                # ✅ Unicode-safe encoding
-                                                pdf.multi_cell(0, 10, line.encode('latin-1', errors='replace').decode('latin-1'))
-                                            file_bytes = pdf.output(dest='S').encode('latin-1', errors='replace')
-                                            mime = "application/pdf"
-                                        else:
-                                            file_bytes = export_content.encode("utf-8")
-                                            mime = "text/plain"
-
-                                        st.download_button(
-                                            label=f"📥 Download {format_choice}",
-                                            data=BytesIO(file_bytes),
-                                            file_name=f"{file_base}.{format_choice.lower()}",
-                                            mime=mime,
-                                            key=f"download_{file_base}_{format_choice}"
-                                        )
-
-                        except Exception as e:
-                            st.warning(f"⚠ Couldn't read attachments for {title}: {e}")
-
-                if len(summaries) > 1:
-                    st.markdown("## 📦 Download All Summaries")
-                    all_export = ""
-                    for title, summary, quotes in summaries:
-                        all_export += f"\n\n---\n\n{title}\n\nTop Quotes:\n{quotes}\n\nSummary with Timestamps:\n{summary}\n"
-
-                    file_name = st.text_input("Filename for all summaries:", value="All_Summaries")
-                    all_format = st.selectbox("Choose format:", ["PDF", "TXT"])
-
-                    if all_format == "PDF":
+                    file_name = st.text_input("Filename (without extension):", value="All_Summaries")
+                    export_format = st.selectbox("Format:", ["PDF", "TXT"])
+                    if export_format == "PDF":
                         pdf = FPDF()
                         pdf.add_page()
                         pdf.set_font("Arial", size=12)
-                        for line in all_export.split("\n"):
-                            # ✅ Unicode-safe encoding
-                            pdf.multi_cell(0, 10, line.encode('latin-1', errors='replace').decode('latin-1'))
-                        file_data = pdf.output(dest="S").encode("latin-1", errors='replace')
-                        mime_type = "application/pdf"
+                        for line in remove_emojis(all_text).split("\n"):
+                            pdf.multi_cell(0, 10, line)
+                        file_data = pdf.output(dest="S").encode("latin-1")
+                        mime = "application/pdf"
                         ext = "pdf"
                     else:
-                        file_data = all_export.encode("utf-8")
-                        mime_type = "text/plain"
+                        file_data = all_text.encode("utf-8")
+                        mime = "text/plain"
                         ext = "txt"
 
                     st.download_button(
                         label=f"📥 Download All as {ext.upper()}",
                         data=BytesIO(file_data),
                         file_name=f"{file_name.strip() or 'All_Summaries'}.{ext}",
-                        mime=mime_type,
-                        key=f"download_all_{ext}"
+                        mime=mime
                     )
-
         except Exception as e:
-            st.error(f"❌ Error fetching pages: {str(e)}")
+            st.error(f"Error loading pages: {e}")
 else:
-    st.error("❌ Connection to Confluence failed.")
+    st.error("❌ Could not connect to Confluence.")

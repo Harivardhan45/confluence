@@ -4,7 +4,7 @@ import streamlit as st
 from dotenv import load_dotenv
 from atlassian import Confluence
 import google.generativeai as genai
-from moviepy.editor import VideoFileClip
+from moviepy import VideoFileClip
 from faster_whisper import WhisperModel
 from fpdf import FPDF
 from io import BytesIO

@@ -18,7 +18,7 @@ import warnings
 
 # Optional imports for video summarizer
 try:
-    from moviepy import VideoFileClip
+    from moviepy.editor import VideoFileClip
     from faster_whisper import WhisperModel
 except ImportError:
     VideoFileClip = None

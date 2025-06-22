@@ -6,6 +6,6 @@ google-generativeai
 python-dotenv
 atlassian-python-api
 faster-whisper
-moviepy
+moviepy.editor
 regex
 requests
